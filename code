@@ -1,0 +1,275 @@
+!pip install akshare pandas numpy pytz
+import akshare as ak
+import pandas as pd
+import numpy as np
+from datetime import datetime, time
+import pytz
+
+# =========================================
+# 0) 你只需要改这里
+# =========================================
+SYMBOL = "159915"  # A股ETF代码，如 159915 / 510300 / 512480 等
+W = 0.50           # 当前仓位（0~1）
+# =========================================
+
+# =========================================
+# 1) 北京时间与交易时段判别（ETF同A股）
+# =========================================
+def beijing_now_str():
+    tz = pytz.timezone("Asia/Shanghai")
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+def is_intraday_cn():
+    tz = pytz.timezone("Asia/Shanghai")
+    now = datetime.now(tz).time()
+    morning = time(9, 30) <= now <= time(11, 30)
+    afternoon = time(13, 0) <= now <= time(15, 0)
+    return morning or afternoon
+
+MODE = "盘中" if is_intraday_cn() else "收盘后"
+
+# =========================================
+# 2) 数据获取：A股ETF优先用 fund_etf_hist_em
+# =========================================
+def get_etf_daily(symbol: str, lookback_days: int = 260) -> pd.DataFrame:
+    """
+    返回列：date, open, high, low, close, volume
+    """
+    try:
+        df = ak.fund_etf_hist_em(symbol=symbol, period="daily", adjust="qfq")
+        # 常见列名：日期、开盘、收盘、最高、最低、成交量
+        df = df.rename(columns={
+            "日期": "date",
+            "开盘": "open",
+            "最高": "high",
+            "最低": "low",
+            "收盘": "close",
+            "成交量": "volume",
+        })
+        df = df[["date", "open", "high", "low", "close", "volume"]]
+    except Exception:
+        # 兜底：部分代码可能走 stock_zh_a_hist
+        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq")
+        df = df.rename(columns={
+            "日期": "date",
+            "开盘": "open",
+            "最高": "high",
+            "最低": "low",
+            "收盘": "close",
+            "成交量": "volume",
+        })
+        df = df[["date", "open", "high", "low", "close", "volume"]]
+
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # 只取最近 lookback_days 个交易日（近似）
+    return df.tail(lookback_days).reset_index(drop=True)
+
+df = get_etf_daily(SYMBOL)
+
+if len(df) < 80:
+    raise ValueError("数据不足，建议换更久的区间或确认ETF代码是否正确。")
+
+# =========================================
+# 3) 指标函数
+# =========================================
+def vwap_proxy(df_: pd.DataFrame, n: int = 20) -> float:
+    x = df_.tail(n)
+    typical = (x["high"] + x["low"] + x["close"]) / 3.0
+    return float((typical * x["volume"]).sum() / x["volume"].sum())
+
+def atr(df_: pd.DataFrame, n: int = 10) -> float:
+    prev_close = df_["close"].shift(1)
+    tr = pd.concat([
+        (df_["high"] - df_["low"]),
+        (df_["high"] - prev_close).abs(),
+        (df_["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return float(tr.rolling(n).mean().iloc[-1])
+
+def max_drawdown(close: pd.Series, window: int = 10) -> float:
+    s = close.tail(window)
+    peak = s.cummax()
+    dd = (s / peak - 1.0).min()
+    return float(abs(dd))
+
+def price_density_zone(df_: pd.DataFrame, lookback: int = 60, bins: int = 60, mass: float = 0.60):
+    """
+    ETF建议用更长 lookback + 更大 mass，更稳地刻画结构区
+    返回 (zone_low, zone_high=P_struct)
+    """
+    x = df_.tail(lookback)
+    price = ((x["high"] + x["low"] + x["close"]) / 3.0).values
+    weight = x["volume"].values.astype(float)
+
+    pmin, pmax = float(price.min()), float(price.max())
+    if pmax <= pmin:
+        return pmin, pmax
+
+    hist, edges = np.histogram(price, bins=bins, range=(pmin, pmax), weights=weight)
+    total = hist.sum()
+    if total <= 0:
+        return pmin, pmax
+
+    target = total * mass
+
+    best = None  # (width, -sum, li, rj)
+    for i in range(len(hist)):
+        s = 0.0
+        for j in range(i, len(hist)):
+            s += hist[j]
+            if s >= target:
+                cand = (j - i, -s, i, j)
+                if best is None or cand < best:
+                    best = cand
+                break
+
+    if best is None:
+        k = int(np.argmax(hist))
+        return float(edges[k]), float(edges[k + 1])
+
+    _, _, li, rj = best
+    return float(edges[li]), float(edges[rj + 1])
+
+def short_zone(df_: pd.DataFrame, n: int = 5):
+    x = df_.tail(n)
+    return float(x["low"].min()), float(x["high"].max())
+
+def slope(series: pd.Series) -> float:
+    s = series.dropna().values
+    if len(s) < 6:
+        return 0.0
+    x = np.arange(len(s))
+    # 简单线性回归斜率
+    k = np.polyfit(x, s, 1)[0]
+    return float(k)
+
+def amp(series: pd.Series) -> float:
+    s = series.dropna()
+    if len(s) == 0:
+        return 0.0
+    return float((s.max() - s.min()) / s.mean())
+
+# =========================================
+# 4) 计算核心变量（C / P_struct / P_short / Base_P / R）
+# =========================================
+last = float(df["close"].iloc[-1])
+
+C = vwap_proxy(df, 20)
+
+# 结构P（ETF更稳参数）
+zone_low_struct, P_struct = price_density_zone(df, lookback=60, bins=60, mass=0.60)
+
+# 短期P（盘面压力）
+short_low, P_short = short_zone(df, n=5)
+
+Base_P = max(P_struct, P_short)
+
+ATR10 = atr(df, 10)
+R10 = max_drawdown(df["close"], 10)
+
+# =========================================
+# 5) C_amp / P_amp / AR / SG / Corr（结构辅助）
+# =========================================
+# C序列：rolling vwap（为了速度，用近似：滚动20日vwap）
+typical = (df["high"] + df["low"] + df["close"]) / 3.0
+vwap_series = (typical * df["volume"]).rolling(20).sum() / df["volume"].rolling(20).sum()
+
+# P序列：用短期P序列近似（计算成本低）
+p_short_series = df["high"].rolling(5).max()
+
+C_amp = amp(vwap_series.tail(15))
+P_amp = amp(p_short_series.tail(15))
+AR = C_amp / (P_amp + 1e-6)
+
+SG = slope(vwap_series.tail(15)) - slope(p_short_series.tail(15))
+
+Corr = float(pd.concat([vwap_series, p_short_series], axis=1).corr().iloc[0, 1])
+
+# =========================================
+# 6) P_upgrade_level & NextP_band（更贴ETF）
+# =========================================
+def p_upgrade_level(C_amp, P_amp, SG, Corr):
+    # ETF更稳：相关性更重要
+    if SG > 0 and Corr > 0.35 and C_amp <= P_amp:
+        return "高"
+    if Corr > 0.15:
+        return "中"
+    return "低"
+
+upgrade = p_upgrade_level(C_amp, P_amp, SG, Corr)
+k_map = {"低": 0.6, "中": 1.0, "高": 1.4}
+k = k_map[upgrade]
+
+NextP_low = Base_P
+NextP_high = Base_P + k * ATR10
+NextP_band = (round(NextP_low, 3), round(NextP_high, 3))
+
+# C_opt_score：是否值得继续“磨C/动仓”
+C_opt_score = ( ( (NextP_low + NextP_high)/2 - C ) / C ) - R10 * (1 + W)
+
+# =========================================
+# 7) 盘中三色灯 / 盘后 NextAction
+# =========================================
+def intraday_light(last, zone_low, base_p, atr10):
+    # ETF盘中更建议少动：只给“风控/观察/不动”
+    if last < zone_low:
+        return "🔴 红灯：跌破结构支撑，优先风控/减仓"
+    if last >= base_p - 0.15 * atr10:
+        return "🟡 黄灯：接近压力位Base_P，仅观察是否突破"
+    return "🟢 绿灯：结构稳定，禁止操作（不做T）"
+
+def next_action(last, C, base_p, zone_low, upgrade, score, r10, atr10):
+    if last < zone_low:
+        return "结构破坏：停止操作，优先风控/考虑降仓"
+    if r10 > 0.08:
+        return "风险抬升：以防守为主，减少暴露"
+    if upgrade == "高":
+        if last >= base_p:
+            return "结构升级确认：减少/停止T，持仓等待趋势段"
+        return "升级条件成熟：不折腾，耐心等待确认"
+    if upgrade == "中":
+        if score > 0 and last <= base_p - 0.5 * atr10:
+            return "结构尚可：仅在回踩时小幅优化C（轻仓）"
+        return "结构改善：减少T，等待突破确认"
+    # upgrade低
+    if score < -0.02:
+        return "性价比偏低：不建议加仓，必要时逐步降低仓位"
+    return "观望：保持仓位，等待结构明朗"
+
+# =========================================
+# 8) 输出
+# =========================================
+print("\n==============================")
+print("📊 A股ETF Model B 决策面板")
+print("==============================")
+print(f"市场类型: A股ETF")
+print(f"北京时间: {beijing_now_str()}")
+print(f"当前模式: {MODE}")
+print(f"ETF代码: {SYMBOL}")
+print("------------------------------")
+
+print(f"last: {last:.3f}")
+print(f"C: {C:.3f}")
+print(f"P_struct: {P_struct:.3f}")
+print(f"P_short: {P_short:.3f}")
+print(f"Base_P: {Base_P:.3f}")
+print(f"zone_low_struct: {zone_low_struct:.3f}")
+print(f"short_low: {short_low:.3f}")
+print(f"C_amp: {C_amp:.4f}")
+print(f"P_amp: {P_amp:.4f}")
+print(f"AR(Camp/Pamp): {AR:.3f}")
+print(f"SG(Cslope-Pslope): {SG:.4f}")
+print(f"Corr(C,P): {Corr:.3f}")
+print(f"ATR10: {ATR10:.3f}")
+print(f"R10: {R10:.4f}")
+print("------------------------------")
+
+if MODE == "盘中":
+    print("🚦 盘中三色灯:", intraday_light(last, zone_low_struct, Base_P, ATR10))
+else:
+    print(f"P_upgrade_level: {upgrade}")
+    print(f"NextP_band: {NextP_band}")
+    print(f"C_opt_score: {C_opt_score:.4f}")
+    print("📌 接下来建议:", next_action(last, C, Base_P, zone_low_struct, upgrade, C_opt_score, R10, ATR10))
